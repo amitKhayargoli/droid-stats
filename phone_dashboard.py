@@ -4,43 +4,62 @@ import re
 
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
-from rich.panel import Panel
 from rich.align import Align
+from rich.layout import Layout
 
 console = Console()
 
 # ---------------- DEVICE DETECTION ---------------- #
+
 def get_device():
+    """Return the first connected device ID, or None."""
     try:
         result = subprocess.check_output(["adb", "devices"], text=True)
-
         for line in result.splitlines()[1:]:
             if "\tdevice" in line and "offline" not in line:
                 return line.split("\t")[0]
-
         return None
-
     except Exception:
         return None
 
 
 def wait_for_device():
-    console.print("[bold yellow]🔍 Waiting for Android device...[/bold yellow]")
-
+    """Keep polling until a device is connected, then return its ID."""
+    console.print("[bold yellow]Waiting for Android device...[/bold yellow]")
     while True:
         device = get_device()
-
         if device:
-            console.print(f"[bold green]✅ Connected: {device}[/bold green]")
+            console.print(f"[bold green]Connected: {device}[/bold green]")
             return device
-
-        console.print("[red]❌ No device found. Connect via Wireless Debugging...[/red]")
+        console.print("[red]No device found. Connect via Wireless Debugging...[/red]")
         time.sleep(3)
 
 
+def is_device_connected(device):
+    """Check if a previously-known device is still connected."""
+    try:
+        result = subprocess.check_output(["adb", "devices"], text=True)
+        return device in result and "\tdevice" in result
+    except Exception:
+        return False
+
+
+def get_phone_name(device):
+    """Return the human-readable phone model name."""
+    try:
+        name = subprocess.check_output(
+            ["adb", "-s", device, "shell", "getprop", "ro.product.model"],
+            text=True
+        ).strip()
+        return name if name else "Android Device"
+    except Exception:
+        return "Android Device"
+
+
 # ---------------- BATTERY ---------------- #
+
 def get_battery(device):
+    """Return (level_str, status_str, temp_celsius)."""
     try:
         result = subprocess.check_output(
             ["adb", "-s", device, "shell", "dumpsys", "battery"],
@@ -49,34 +68,48 @@ def get_battery(device):
 
         level = "0"
         status = "Unknown"
+        temp = 0.0
+
+        status_map = {
+            "1": "Unknown",
+            "2": "Charging",
+            "3": "Discharging",
+            "4": "Not Charging",
+            "5": "Full",
+        }
 
         for line in result.splitlines():
             line = line.strip()
-
             if line.startswith("level"):
                 level = line.split(":")[1].strip()
-
             if line.startswith("status"):
                 code = line.split(":")[1].strip()
-
-                status_map = {
-                    "1": "Unknown",
-                    "2": "Charging",
-                    "3": "Discharging",
-                    "4": "Not Charging",
-                    "5": "Full",
-                }
-
                 status = status_map.get(code, "Unknown")
+            if line.startswith("temperature"):
+                raw = int(line.split(":")[1].strip())
+                temp = raw / 10.0
 
-        return level, status
+        return level, status, temp
 
     except Exception:
-        return "?", "Error"
+        return "?", "Error", 0.0
+
+
+def battery_color(level):
+    """Return a Rich colour string based on battery percentage."""
+    lvl = int(level) if level.isdigit() else 0
+    if lvl > 60:
+        return "green"
+    elif lvl > 30:
+        return "yellow"
+    else:
+        return "red"
 
 
 # ---------------- RAM (PHONE) ---------------- #
+
 def get_ram(device):
+    """Return (used_gb, total_gb, percent)."""
     try:
         result = subprocess.check_output(
             ["adb", "-s", device, "shell", "cat", "/proc/meminfo"],
@@ -88,9 +121,9 @@ def get_ram(device):
 
         for line in result.splitlines():
             if "MemTotal" in line:
-                total = int(line.split()[1]) / (1024 * 1024)  # GB
+                total = int(line.split()[1]) / (1024 * 1024)  # kB → GB
             if "MemAvailable" in line:
-                avail = int(line.split()[1]) / (1024 * 1024)  # GB
+                avail = int(line.split()[1]) / (1024 * 1024)  # kB → GB
 
         used = total - avail
         percent = (used / total) * 100 if total else 0
@@ -102,7 +135,9 @@ def get_ram(device):
 
 
 # ---------------- STORAGE (PHONE) ---------------- #
+
 def get_storage(device):
+    """Return (used_gb, total_gb, percent)."""
     try:
         result = subprocess.check_output(
             ["adb", "-s", device, "shell", "df", "/sdcard"],
@@ -126,13 +161,50 @@ def get_storage(device):
         return 0, 0, 0
 
 
-# ---------------- UI ---------------- #
+# ---------------- CPU ---------------- #
+
+def get_cpu(device):
+    """Return (total_cpu_percent, load_1m).
+
+    Parses ``adb shell dumpsys cpuinfo`` output.
+    """
+    try:
+        out = subprocess.check_output(
+            ["adb", "-s", device, "shell", "dumpsys", "cpuinfo"],
+            text=True
+        )
+
+        percent = 0.0
+        load_1m = 0.0
+
+        for line in out.splitlines():
+            # "Load: 1.5 / 1.8 / 2.0"
+            if line.startswith("Load:"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        load_1m = float(parts[1].rstrip(","))
+                    except ValueError:
+                        pass
+
+            # "24% TOTAL: 15% user + 8% kernel + 1% iowait"
+            match = re.search(r"(\d+(?:\.\d+)?)%\s+TOTAL", line)
+            if match:
+                percent = float(match.group(1))
+
+        return percent, load_1m
+
+    except Exception:
+        return 0, 0, 0
+
+
+# ---------------- UI HELPERS ---------------- #
 
 def _bar(percent, width=18, good_below=60, warn_below=85, reverse=False):
-    """Build a colored unicode progress bar.
+    """Build a coloured unicode progress bar.
 
-    By default, higher percent = worse (for usage metrics like RAM/storage).
-    Set reverse=True when higher percent = better (e.g. battery level).
+    By default higher percent = worse (usage metrics like RAM / storage).
+    Set *reverse=True* when higher percent = better (e.g. battery level).
     """
     filled = round(percent / 100 * width)
     filled = max(0, min(filled, width))
@@ -146,61 +218,100 @@ def _bar(percent, width=18, good_below=60, warn_below=85, reverse=False):
     return f"[{color}]{bar_chars}[/{color}]"
 
 
-def build(device):
-    battery, status = get_battery(device)
+# ---------------- UI ---------------- #
+
+def build(device, phone_name):
+    """Render the borderless horizontal dashboard."""
+    battery, status, temp = get_battery(device)
     ram_u, ram_t, ram_p = get_ram(device)
     st_u, st_t, st_p = get_storage(device)
+    cpu_p, cpu_load = get_cpu(device)
 
     b = int(battery) if battery.isdigit() else 0
+    batt_col = battery_color(battery)
 
-    table = Table.grid(expand=True, padding=(0, 3))
-    table.add_column(justify="center", ratio=1)
-    table.add_column(justify="center", ratio=1)
-    table.add_column(justify="center", ratio=1)
-
-    # Row 1: Titles
-    table.add_row(
-        "[bold]📱 Battery[/bold]",
-        "[bold]💻 RAM[/bold]",
-        "[bold]💾 Storage[/bold]"
+    # ── Battery card ───────────────────────────────────────────────
+    batt_text = (
+        "[bold]Battery[/bold]\n\n"
+        f"{_bar(b, good_below=20, warn_below=60, reverse=True)}\n\n"
+        f"[{batt_col} bold]{battery}%[/{batt_col} bold]   {status}\n\n"
+        f"[bold]{temp:.1f}°C[/bold]"
     )
+    batt_card = Align.center(batt_text)
 
-    # Row 2: Progress bars
-    # Battery: higher % is good, so invert the color logic
-    table.add_row(
-        _bar(b, good_below=20, warn_below=60, reverse=True),
-        _bar(ram_p),
-        _bar(st_p)
+    # ── RAM card ───────────────────────────────────────────────────
+    ram_text = (
+        "[bold]RAM[/bold]\n\n"
+        f"{_bar(ram_p)}\n\n"
+        f"[bold]{ram_u:.1f}[/bold] / {ram_t:.1f} GB\n\n"
+        f"{ram_p:.0f}% used"
     )
+    ram_card = Align.center(ram_text)
 
-    # Row 3: Values
-    table.add_row(
-        f"[bold]{battery}%[/bold]",
-        f"[bold]{ram_u:.1f}[/bold] / {ram_t:.1f} GB",
-        f"[bold]{st_u:.1f}[/bold] / {st_t:.1f} GB"
-    )
-
-    # Row 4: Status / details
-    table.add_row(
-        f"⚡ {status}",
-        f"{ram_p:.0f}% used",
+    # ── Storage card ───────────────────────────────────────────────
+    st_text = (
+        "[bold]Storage[/bold]\n\n"
+        f"{_bar(st_p)}\n\n"
+        f"[bold]{st_u:.1f}[/bold] / {st_t:.1f} GB\n\n"
         f"{st_p:.0f}% used"
     )
+    st_card = Align.center(st_text)
 
-    return Panel(
-        Align.center(table),
-        title="[bold magenta]📊 Android Live Dashboard[/bold magenta]",
-        border_style="cyan",
-        subtitle=f"[dim]{device}[/dim]"
+    # ── CPU card ───────────────────────────────────────────────────
+    load_line = f"Load: {cpu_load:.1f}" if cpu_load else "—"
+    cpu_text = (
+        "[bold]CPU[/bold]\n\n"
+        f"{_bar(cpu_p)}\n\n"
+        f"[bold]{cpu_p:.0f}%[/bold]\n\n"
+        f"{load_line}"
+    )
+    cpu_card = Align.center(cpu_text)
+
+    # ── Layout ─────────────────────────────────────────────────────
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=1),
+        Layout(name="body"),
     )
 
+    layout["header"].update(
+        Align.center(
+            f"[bold magenta]{phone_name}[/bold magenta]"
+        )
+    )
+
+    body = Layout()
+    body.split_row(
+        Layout(batt_card),
+        Layout(ram_card),
+        Layout(st_card),
+        Layout(cpu_card),
+    )
+    layout["body"].update(body)
+
+    return layout
+
+
 # ---------------- MAIN ---------------- #
+
 def main():
     device = wait_for_device()
+    phone_name = get_phone_name(device)
 
-    with Live(build(device), refresh_per_second=2, screen=True) as live:
+    with Live(build(device, phone_name), refresh_per_second=2, screen=True) as live:
         while True:
-            live.update(build(device))
+            if not is_device_connected(device):
+                live.update(
+                    Align.center(
+                        "[bold red]Device disconnected!\n\n"
+                        "[yellow]Waiting for reconnection...[/yellow]"
+                    )
+                )
+                device = wait_for_device()
+                phone_name = get_phone_name(device)
+                continue
+
+            live.update(build(device, phone_name))
             time.sleep(2)
 
 
