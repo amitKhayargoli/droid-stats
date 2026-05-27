@@ -48,7 +48,7 @@ def get_phone_name(device):
     """Return the human-readable phone model name."""
     try:
         name = subprocess.check_output(
-            ["adb", "-s", device, "shell", "getprop", "ro.product.model"],
+            ["adb", "-s", device, "shell", "getprop", "ro.product.marketname"],
             text=True
         ).strip()
         return name if name else "Android Device"
@@ -198,6 +198,27 @@ def get_cpu(device):
         return 0, 0, 0
 
 
+# ---------------- SMOOTH TRANSITIONS ---------------- #
+
+class SmoothValue:
+    """A float that exponentially approaches a target on each tick()."""
+    def __init__(self, initial=0.0, rate=0.3):
+        self.current = float(initial)
+        self.target = float(initial)
+        self.rate = rate
+
+    def set_target(self, target):
+        self.target = float(target)
+
+    def tick(self):
+        diff = self.target - self.current
+        if abs(diff) < 0.5:
+            self.current = self.target
+        else:
+            self.current += diff * self.rate
+        return self.current
+
+
 # ---------------- UI HELPERS ---------------- #
 
 def _bar(percent, width=18, good_below=60, warn_below=85, reverse=False):
@@ -220,76 +241,114 @@ def _bar(percent, width=18, good_below=60, warn_below=85, reverse=False):
 
 # ---------------- UI ---------------- #
 
-def build(device, phone_name):
-    """Render the borderless horizontal dashboard."""
-    battery, status, temp = get_battery(device)
-    ram_u, ram_t, ram_p = get_ram(device)
-    st_u, st_t, st_p = get_storage(device)
-    cpu_p, cpu_load = get_cpu(device)
+class DashboardData:
+    """Holds latest ADB data and smoothed bar percentages."""
+    def __init__(self):
+        # Latest fetched values
+        self.battery = "0"
+        self.status = "Unknown"
+        self.temp = 0.0
+        self.ram_u = 0.0
+        self.ram_t = 0.0
+        self.st_u = 0.0
+        self.st_t = 0.0
+        self.cpu_load = 0.0
 
-    b = int(battery) if battery.isdigit() else 0
-    batt_col = battery_color(battery)
+        # Raw percentages from latest fetch (for text display)
+        self.ram_raw_pct = 0.0
+        self.st_raw_pct = 0.0
+        self.cpu_raw_pct = 0.0
 
-    # ── Battery card ───────────────────────────────────────────────
-    batt_text = (
-        "[bold]Battery[/bold]\n\n"
-        f"{_bar(b, good_below=20, warn_below=60, reverse=True)}\n\n"
-        f"[{batt_col} bold]{battery}%[/{batt_col} bold]   {status}\n\n"
-        f"[bold]{temp:.1f}°C[/bold]"
-    )
-    batt_card = Align.center(batt_text)
+        # Smoothed bar percentages (for animated bar transitions)
+        self.batt_pct = SmoothValue(50.0, rate=0.25)
+        self.ram_pct = SmoothValue(50.0, rate=0.25)
+        self.st_pct = SmoothValue(50.0, rate=0.25)
+        self.cpu_pct = SmoothValue(0.0, rate=0.25)
 
-    # ── RAM card ───────────────────────────────────────────────────
-    ram_text = (
-        "[bold]RAM[/bold]\n\n"
-        f"{_bar(ram_p)}\n\n"
-        f"[bold]{ram_u:.1f}[/bold] / {ram_t:.1f} GB\n\n"
-        f"{ram_p:.0f}% used"
-    )
-    ram_card = Align.center(ram_text)
+    def fetch(self, device):
+        """Read all data from ADB and set new smoother targets."""
+        self.battery, self.status, self.temp = get_battery(device)
+        self.ram_u, self.ram_t, self.ram_raw_pct = get_ram(device)
+        self.st_u, self.st_t, self.st_raw_pct = get_storage(device)
+        self.cpu_raw_pct, self.cpu_load = get_cpu(device)
 
-    # ── Storage card ───────────────────────────────────────────────
-    st_text = (
-        "[bold]Storage[/bold]\n\n"
-        f"{_bar(st_p)}\n\n"
-        f"[bold]{st_u:.1f}[/bold] / {st_t:.1f} GB\n\n"
-        f"{st_p:.0f}% used"
-    )
-    st_card = Align.center(st_text)
+        b = int(self.battery) if self.battery.isdigit() else 0
+        self.batt_pct.set_target(float(b))
+        self.ram_pct.set_target(self.ram_raw_pct)
+        self.st_pct.set_target(self.st_raw_pct)
+        self.cpu_pct.set_target(self.cpu_raw_pct)
 
-    # ── CPU card ───────────────────────────────────────────────────
-    load_line = f"Load: {cpu_load:.1f}" if cpu_load else "—"
-    cpu_text = (
-        "[bold]CPU[/bold]\n\n"
-        f"{_bar(cpu_p)}\n\n"
-        f"[bold]{cpu_p:.0f}%[/bold]\n\n"
-        f"{load_line}"
-    )
-    cpu_card = Align.center(cpu_text)
+    def animate(self):
+        """Advance all smoothers one step."""
+        self.batt_pct.tick()
+        self.ram_pct.tick()
+        self.st_pct.tick()
+        self.cpu_pct.tick()
 
-    # ── Layout ─────────────────────────────────────────────────────
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=1),
-        Layout(name="body"),
-    )
+    def render(self, phone_name):
+        """Build the layout using smoothed bar values."""
+        batt_col = battery_color(self.battery)
 
-    layout["header"].update(
-        Align.center(
-            f"[bold magenta]{phone_name}[/bold magenta]"
+        # ── Battery card ───────────────────────────────────────────
+        batt_text = (
+            "[bold]Battery[/bold]\n\n"
+            f"{_bar(self.batt_pct.current, good_below=20, warn_below=60, reverse=True)}\n\n"
+            f"[{batt_col} bold]{self.battery}%[/{batt_col} bold]   {self.status}\n\n"
+            f"[bold]{self.temp:.1f}°C[/bold]"
         )
-    )
+        batt_card = Align.center(batt_text)
 
-    body = Layout()
-    body.split_row(
-        Layout(batt_card),
-        Layout(ram_card),
-        Layout(st_card),
-        Layout(cpu_card),
-    )
-    layout["body"].update(body)
+        # ── RAM card ───────────────────────────────────────────────
+        ram_text = (
+            "[bold]RAM[/bold]\n\n"
+            f"{_bar(self.ram_pct.current)}\n\n"
+            f"[bold]{self.ram_u:.1f}[/bold] / {self.ram_t:.1f} GB\n\n"
+            f"{self.ram_raw_pct:.0f}% used"
+        )
+        ram_card = Align.center(ram_text)
 
-    return layout
+        # ── Storage card ───────────────────────────────────────────
+        st_text = (
+            "[bold]Storage[/bold]\n\n"
+            f"{_bar(self.st_pct.current)}\n\n"
+            f"[bold]{self.st_u:.1f}[/bold] / {self.st_t:.1f} GB\n\n"
+            f"{self.st_raw_pct:.0f}% used"
+        )
+        st_card = Align.center(st_text)
+
+        # ── CPU card ───────────────────────────────────────────────
+        load_line = f"Load: {self.cpu_load:.1f}" if self.cpu_load else "—"
+        cpu_text = (
+            "[bold]CPU[/bold]\n\n"
+            f"{_bar(self.cpu_pct.current)}\n\n"
+            f"[bold]{self.cpu_raw_pct:.0f}%[/bold]\n\n"
+            f"{load_line}"
+        )
+        cpu_card = Align.center(cpu_text)
+
+        # ── Layout ─────────────────────────────────────────────────
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=1),
+            Layout(name="body"),
+        )
+
+        layout["header"].update(
+            Align.center(
+                f"[bold magenta]{phone_name}[/bold magenta]"
+            )
+        )
+
+        body = Layout()
+        body.split_row(
+            Layout(batt_card),
+            Layout(ram_card),
+            Layout(st_card),
+            Layout(cpu_card),
+        )
+        layout["body"].update(body)
+
+        return layout
 
 
 # ---------------- MAIN ---------------- #
@@ -298,8 +357,18 @@ def main():
     device = wait_for_device()
     phone_name = get_phone_name(device)
 
-    with Live(build(device, phone_name), refresh_per_second=2, screen=True) as live:
+    data = DashboardData()
+    data.fetch(device)
+    # snap smoothers to exact targets for instant initial render
+    for s in [data.batt_pct, data.ram_pct, data.st_pct, data.cpu_pct]:
+        s.current = s.target
+
+    last_fetch = time.monotonic()
+
+    with Live(data.render(phone_name), refresh_per_second=10, screen=True) as live:
         while True:
+            now = time.monotonic()
+
             if not is_device_connected(device):
                 live.update(
                     Align.center(
@@ -309,10 +378,19 @@ def main():
                 )
                 device = wait_for_device()
                 phone_name = get_phone_name(device)
+                data.fetch(device)
+                for s in [data.batt_pct, data.ram_pct, data.st_pct, data.cpu_pct]:
+                    s.current = s.target
+                last_fetch = time.monotonic()
                 continue
 
-            live.update(build(device, phone_name))
-            time.sleep(2)
+            if now - last_fetch >= 2:
+                data.fetch(device)
+                last_fetch = now
+
+            data.animate()
+            live.update(data.render(phone_name))
+            time.sleep(0.1)
 
 
 if __name__ == "__main__":
